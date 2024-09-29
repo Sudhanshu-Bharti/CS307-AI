@@ -29,7 +29,7 @@ def tsp_read(nodes):
 
 def main():
     # generate_random_coords(100)
-    nodes, place = tsp_read("./tsp/Data/rajasthan.tsp")
+    nodes, place = tsp_read("./Lab 4/tsp/Data/rajasthan.tsp")
     coords = np.array(nodes)
     n = len(coords)
     start = time.time_ns()

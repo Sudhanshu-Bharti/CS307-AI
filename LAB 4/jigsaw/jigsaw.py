@@ -1,147 +1,230 @@
+
 import numpy as np
 import matplotlib.pyplot as plt
+import cv2
+import random
+import math
+import copy
+from tqdm import tqdm
+from collections import deque
 
-# Load the scrambled image from the .mat file
-f = open('scrambled.mat')
+def read_matrix_file(filepath):
+    data = []
+    with open(filepath, "r") as file:
+        content = file.readlines()
+    matrix_data = content[5:]
+    for row in matrix_data:
+        row = row.strip()
+        if row:
+            try:
+                data.append(int(row))
+            except ValueError:
+                print(f"Invalid row skipped: {row}")
+    data_array = np.array(data)
+    if data_array.size != 512 * 512:
+        raise ValueError(f"Expected 262144 elements, but got {data_array.size} elements.")
+    return data_array.reshape((512, 512))
 
-# Skip the first 5 lines
-for i in range(5):
-    f.readline()
+def split_into_segments(img):
+    segment_size = 128
+    segments_per_side = img.shape[0] // segment_size
+    segments = {}
+    layout = []
+    counter = 0
+    for i in range(segments_per_side):
+        row = []
+        for j in range(segments_per_side):
+            row.append(counter)
+            segment = img[
+                i * segment_size : (i + 1) * segment_size,
+                j * segment_size : (j + 1) * segment_size,
+            ]
+            segments[counter] = segment
+            counter += 1
+        layout.append(row)
+    return segments, layout
 
-m = []
-line = f.readline()
-# Read the values from the file until an empty line is reached
-while line[1:] != '':
-    val = int(line[1:])
-    m.append(val)
-    line = f.readline()
+def assemble_image(segments, arrangement):
+    segment_height, segment_width = segments[0].shape[:2]
+    rows = len(arrangement)
+    cols = len(arrangement[0])
+    assembled = np.zeros(
+        (rows * segment_height, cols * segment_width), dtype=np.uint8
+    )
+    for i, row in enumerate(arrangement):
+        for j, seg_idx in enumerate(row):
+            assembled[
+                i * segment_height : (i + 1) * segment_height,
+                j * segment_width : (j + 1) * segment_width,
+            ] = segments[seg_idx]
+    return assembled
 
-# Convert the list to a NumPy array
-x = np.array(m)
+def calculate_difference(arr1, arr2):
+    return np.sum(np.abs(arr1 - arr2))
 
-# Ensure we reshape according to the actual size of the input data
-size = int(np.sqrt(x.size))  # Calculate size based on the number of elements
-mat = x.reshape(size, size).T  # Reshape and transpose the array
+def find_best_match(candidates, parent_seg, child_seg, direction):
+    min_diff = float('inf')
+    best_match = -1
+    parent_seg = np.array(parent_seg)
+    for candidate in candidates:
+        diff = 0
+        child_segment = np.array(child_seg[candidate])
+        if direction == (0, 1):
+            diff = np.sum(np.abs(parent_seg[:, -1] - child_segment[:, 0]))
+        elif direction == (0, -1):
+            diff = np.sum(np.abs(parent_seg[:, 0] - child_segment[:, -1]))
+        elif direction == (1, 0):
+            diff = np.sum(np.abs(parent_seg[-1, :] - child_segment[0, :]))
+        elif direction == (-1, 0):
+            diff = np.sum(np.abs(parent_seg[0, :] - child_segment[-1, :]))
+        if diff < min_diff:
+            min_diff = diff
+            best_match = candidate
+    return best_match
 
-# Class definition for Energy calculation
-class Energy:
-    def __init__(self, image):
-        self.image = image
-        self.height = 4
-        self.width = 4
+def breadth_first_arrangement(layout, segments, options):
+    moves = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+    queue = deque([(0, 0)])
+    seen = set()
+    seen.add((0, 0))
+    while queue:
+        x, y = queue.popleft()
+        for dx, dy in moves:
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < 4 and 0 <= ny < 4 and (nx, ny) not in seen:
+                queue.append((nx, ny))
+                seen.add((nx, ny))
+                best_segment = find_best_match(options, segments[layout[x][y]], segments, (dx, dy))
+                layout[nx][ny] = best_segment
+                options.remove(best_segment)
 
-    def getLeftRightEnergy(self, tile):
-        try:
-            i, j = tile
-            x1 = 128 * i
-            x2 = 128 * (i + 1)
-            y = 128 * (j + 1) - 1
-            diff = self.image[x1:x2, y] - self.image[x1:x2, y + 1]
-            return np.sqrt((diff ** 2).mean())
-        except IndexError:
-            return 0
+def display_image(img):
+    plt.imshow(img, cmap="gray")
+    plt.title("Reconstructed 512x512 Image")
+    plt.colorbar()
+    plt.show()
 
-    def getUpDownEnergy(self, tile):
-        try:
-            i, j = tile
-            y1 = 128 * j
-            y2 = 128 * (j + 1)
-            x = 128 * (i + 1) - 1
-            diff = self.image[x, y1:y2] - self.image[x + 1, y1:y2]
-            return np.sqrt((diff ** 2).mean())
-        except IndexError:
-            return 0
+def get_adjacent_cells(row, col, grid):
+    adjacent = []
+    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+        new_row, new_col = row + dr, col + dc
+        if 0 <= new_row < len(grid) and 0 <= new_col < len(grid[0]):
+            adjacent.append((new_row, new_col))
+    return adjacent
 
-    def getEnergyAround(self, tile):
-        i, j = tile
-        e = np.zeros(4)
-        e[0] = self.getLeftRightEnergy((i, j - 1))
-        e[1] = self.getLeftRightEnergy((i, j))
-        e[2] = self.getUpDownEnergy((i - 1, j))
-        e[3] = self.getUpDownEnergy((i, j))
-        return e.sum()
+def evaluate_arrangement(arrangement, segments):
+    total_diff = 0
+    for i in range(len(arrangement)):
+        for j in range(len(arrangement[0])):
+            neighbors = get_adjacent_cells(i, j, arrangement)
+            for nr, nc in neighbors:
+                if nc == j + 1:
+                    total_diff += np.sum(np.abs(segments[arrangement[i][j]][:, -1] - segments[arrangement[nr][nc]][:, 0]))
+                elif nc == j - 1:
+                    total_diff += np.sum(np.abs(segments[arrangement[nr][nc]][:, -1] - segments[arrangement[i][j]][:, 0]))
+                elif nr == i + 1:
+                    total_diff += np.sum(np.abs(segments[arrangement[i][j]][-1, :] - segments[arrangement[nr][nc]][0, :]))
+                elif nr == i - 1:
+                    total_diff += np.sum(np.abs(segments[arrangement[nr][nc]][-1, :] - segments[arrangement[i][j]][0, :]))
+    return np.sqrt(total_diff)
 
-    def getEnergyAround2Tiles(self, t1, t2):
-        return self.getEnergyAround(t1) + self.getEnergyAround(t2)
+def compute_edge_strength(image, threshold=100):
+    grad_x = cv2.Sobel(image, cv2.CV_64F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(image, cv2.CV_64F, 0, 1, ksize=3)
+    magnitude = np.sqrt(grad_x**2 + grad_y**2)
+    grad_x[magnitude < threshold] = 0
+    grad_y[magnitude < threshold] = 0
+    return np.sqrt(np.sum(np.abs(grad_x)) + np.sum(np.abs(grad_y)))
 
-    def energy(self):
-        energy = 0
-        for i in range(1, self.height - 1):
-            for j in range(1, self.width - 1):
-                energy += self.getEnergyAround((i, j))
-        return energy
+def optimize_arrangement(initial_arrangement, segments, initial_score):
+    current = copy.deepcopy(initial_arrangement)
+    best = copy.deepcopy(initial_arrangement)
+    current_score = initial_score
+    best_score = current_score
+    start_temp = 10
+    end_temp = 1
+    cooling_rate = 0.995
+    temp = start_temp
+    while temp > end_temp:
+        i1, j1 = random.randint(0, 3), random.randint(0, 3)
+        i2, j2 = random.randint(0, 3), random.randint(0, 3)
+        current[i1][j1], current[i2][j2] = current[i2][j2], current[i1][j1]
+        new_score = evaluate_arrangement(current, segments)
+        if new_score < current_score or random.random() < math.exp((current_score - new_score) / temp):
+            current_score = new_score
+            if current_score < best_score:
+                best_score = current_score
+                best = copy.deepcopy(current)
+        else:
+            current[i1][j1], current[i2][j2] = current[i2][j2], current[i1][j1]
+        temp *= cooling_rate
+    return best, best_score
 
-# Function to plot and save the current state of the puzzle
-def plot_puzzle(image, iteration, energy):
-    plt.figure(figsize=(10, 10))
-    plt.imshow(image)
-    plt.title(f"Puzzle State at Iteration {iteration}\nEnergy: {energy:.2f}")
-    plt.axis('off')
-    plt.savefig(f'puzzle_state_iter_{iteration}.png')
-    plt.close()
-
-# Initialize Energy object
-e = Energy(image=mat)
-initial_energy = e.energy()
-
-# Simulated Annealing parameters
-max_iter = 100000
-temp = 1000
-stop_temp = 0.00005
-decay = 0.9995
-x = np.arange(0, 4)
-y = np.arange(0, 4)
-curr_iter = 0
-best_cost = initial_energy
-best = mat.copy()
-cost_list = [best_cost]
-
-# Plot interval (e.g., every 10000 iterations)
-plot_interval = 10000
-
-# Plot initial state
-plot_puzzle(best, 0, best_cost)
-
-# Simulated Annealing loop
-while curr_iter < max_iter and temp > stop_temp:
-    new = best.copy()
-    np.random.shuffle(x)
-    np.random.shuffle(y)
+def display_comparison(img1, img2, title1, title2):
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
     
-    cost_old = Energy(image=new).getEnergyAround2Tiles((x[0], y[0]), (x[1], y[1]))
-    new[128*x[0]:128*x[0]+128, 128*y[0]:128*y[0]+128], new[128*x[1]:128*x[1]+128, 128*y[1]:128*y[1]+128] = \
-        new[128*x[1]:128*x[1]+128, 128*y[1]:128*y[1]+128].copy(), new[128*x[0]:128*x[0]+128, 128*y[0]:128*y[0]+128].copy()
+    ax1.imshow(img1, cmap="gray")
+    ax1.set_title(title1)
+    ax1.axis('off')
     
-    cost_new = Energy(image=new).getEnergyAround2Tiles((x[0], y[0]), (x[1], y[1]))
+    ax2.imshow(img2, cmap="gray")
+    ax2.set_title(title2)
+    ax2.axis('off')
     
-    if cost_new < cost_old or np.random.rand() < np.exp(-abs(cost_old - cost_new) / temp):
-        best = new.copy()
-        best_cost = Energy(image=best).energy()
-    
-    temp *= decay
-    curr_iter += 1
-    cost_list.append(best_cost)
-    
-    # Print progress and plot puzzle state at fixed intervals
-    if curr_iter % plot_interval == 0:
-        print(f"Iteration: {curr_iter}, Best Cost: {best_cost}, Temperature: {temp:.6f}")
-        plot_puzzle(best, curr_iter, best_cost)
+    plt.tight_layout()
+    plt.show()
 
-# Plot the final solved image
-plot_puzzle(best, curr_iter, best_cost)
-
-# Plot the cost vs iteration graph
-plt.figure(figsize=(10, 6))
-plt.plot(cost_list)
-plt.xlabel('Iterations')
-plt.ylabel('Energy Cost')
-plt.title('Energy Cost vs. Iterations')
-plt.savefig('cost_vs_iterations.png')
-plt.close()
-
-print(f"Initial energy: {initial_energy}")
-print(f"Final energy: {best_cost}")
-print(f"Total iterations: {curr_iter}")
-print("Solved jigsaw puzzle saved as 'puzzle_state_iter_{curr_iter}.png'")
-print("Intermediate puzzle states saved as 'puzzle_state_iter_X.png'")
-print("Cost vs. iterations graph saved as 'cost_vs_iterations.png'")
+if __name__ == "__main__":
+    print("Starting image reconstruction process...")
+    matrix = read_matrix_file("./Lab 4/jigsaw/scrambled.mat")
+    print(f"Loaded matrix shape: {matrix.shape}")
+    matrix = matrix.T
+    segments, initial_layout = split_into_segments(matrix)
+    print(f"Number of segments: {len(segments)}")
+    
+    optimal_layout = None
+    optimal_score = float('inf')
+    initial_image = None
+    
+    print("Beginning optimization process...")
+    for start_segment in range(16):
+        layout = [[-1 for _ in range(4)] for _ in range(4)]
+        layout[0][0] = start_segment
+        remaining_segments = list(range(16))
+        remaining_segments.remove(start_segment)
+        breadth_first_arrangement(layout, segments, remaining_segments)
+        
+        temp_layout = copy.deepcopy(layout)
+        temp_image = assemble_image(segments, temp_layout)
+        
+        if start_segment == 0:
+            initial_image = temp_image
+            print(f"Initial edge strength (iteration 0): {compute_edge_strength(initial_image):.2f}")
+        
+        score = compute_edge_strength(temp_image)
+        improved_layout, new_score = optimize_arrangement(temp_layout, segments, score)
+        
+        print(f"Start segment: {start_segment}, Initial score: {score:.2f}, Improved score: {new_score:.2f}")
+        
+        if score < optimal_score:
+            optimal_layout = layout
+            optimal_score = score
+        
+        best_image = assemble_image(segments, optimal_layout)
+        new_score = compute_edge_strength(best_image)
+        if new_score < optimal_score:
+            optimal_layout = improved_layout
+            optimal_score = new_score
+    
+    final_image = assemble_image(segments, optimal_layout)
+    final_score = compute_edge_strength(final_image)
+    
+    print(f"\nInitial edge strength: {compute_edge_strength(initial_image):.2f}")
+    print(f"Final edge strength: {final_score:.2f}")
+    print(f"Improvement: {(compute_edge_strength(initial_image) - final_score) / compute_edge_strength(initial_image) * 100:.2f}%")
+    
+    print("\nDisplaying comparison between initial and final images...")
+    display_comparison(initial_image, final_image, "Initial Reconstruction", "Final Reconstruction")
+    
+    print("\nDisplaying final reconstructed image...")
+    display_image(final_image)
